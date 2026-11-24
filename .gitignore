@@ -1,0 +1,11 @@
+# Do not upload private home-directory files
+.*
+!.gitignore
+!.gitattributes
+
+# Nested repository metadata
+**/.git/
+
+# Temporary file****/__pycache__/
+**/*.pyc
+*~
