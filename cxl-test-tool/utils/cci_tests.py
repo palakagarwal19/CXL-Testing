@@ -1,0 +1,164 @@
+# utils/cci_tests.py
+import os
+import json
+import base64
+import datetime
+import utils.cxl as cxl
+from utils.tools import execute_on_vm, vm_is_running, system_env
+
+GUEST_BIN_LOCAL = os.path.expanduser("~/cxl-test-tool/cci-tests/cci_full_suite")
+GUEST_BIN_REMOTE = "/tmp/cci_full_suite"
+
+def print_test_result(index, total, status, week, category, name,
+                      elapsed, detail):
+    print()
+    print("-" * 72)
+    print(f"[{index:02d}/{total:02d}] [{status}] {name}")
+    print(f"        {category} | {elapsed:.4f}s | {detail}")
+
+
+def _deploy_guest_binary():
+    if not os.path.exists(GUEST_BIN_LOCAL):
+        raise FileNotFoundError(f"Compiled binary not found at {GUEST_BIN_LOCAL}")
+    with open(GUEST_BIN_LOCAL, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
+    # Transfer in chunks to avoid shell argument length limits
+    execute_on_vm(f"rm -f {GUEST_BIN_REMOTE}.b64 {GUEST_BIN_REMOTE}")
+    chunk_size = 32768
+    for i in range(0, len(encoded), chunk_size):
+        chunk = encoded[i:i + chunk_size]
+        execute_on_vm(f"printf '%s' '{chunk}' >> {GUEST_BIN_REMOTE}.b64")
+    execute_on_vm(f"base64 -d {GUEST_BIN_REMOTE}.b64 > {GUEST_BIN_REMOTE} && rm -f {GUEST_BIN_REMOTE}.b64 && chmod +x {GUEST_BIN_REMOTE}")
+
+
+def _write_reports(results, dev_path, started):
+    log_dir = system_env("cxl_test_log_dir") or "/tmp"
+    os.makedirs(log_dir, exist_ok=True)
+    ts = started.strftime("%Y%m%d_%H%M%S")
+    txt_path = os.path.join(log_dir, f"cci_report_{ts}.txt")
+    html_path = os.path.join(log_dir, f"cci_report_{ts}.html")
+
+    total = len(results)
+    passed = sum(1 for r in results if r["status"] == "PASS")
+    skipped = sum(1 for r in results if r["status"] == "SKIP")
+    failed = total - passed - skipped
+
+    with open(txt_path, "w") as f:
+        f.write("========================================================================\n")
+        f.write("CXL 3.0 CCI COMMAND TEST SUITE REPORT\n")
+        f.write("========================================================================\n")
+        f.write(f"Timestamp : {started}\n")
+        f.write(f"Device    : {dev_path}\n")
+        f.write(f"Summary   : {passed} PASSED | {skipped} SKIPPED | {failed} FAILED (Total: {total})\n")
+        f.write("========================================================================\n\n")
+        for r in results:
+            f.write(f"[{r['status']}] {r['phase']} :: {r['category']} - {r['name']} ({r['elapsed']}s)\n")
+            f.write(f"        {r['detail']}\n")
+            f.write("-" * 72 + "\n")
+
+    rows = []
+    for r in results:
+        bg = "#d4edda" if r["status"] == "PASS" else ("#fff3cd" if r["status"] == "SKIP" else "#f8d7da")
+        rows.append(
+                f"<tr style='background:{bg}'>"
+                f"<td><b>{r['status']}</b></td>"
+                f"<td>{r['phase']}</td>"
+                f"<td>{r['category']}</td>"
+                f"<td>{r['name']}</td>"
+                f"<td>{r['elapsed']}s</td>"
+                f"<td><code>{r['detail']}</code></td>"
+                f"</tr>"
+                )
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CXL 3.0 CCI Test Suite Report</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 24px; color: #1f2328; }}
+  table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
+  th, td {{ border: 1px solid #d0d7de; padding: 10px; text-align: left; font-size: 14px; }}
+  th {{ background: #f6f8fa; }}
+  code {{ font-size: 13px; }}
+</style>
+</head>
+<body>
+  <h2>CXL 3.0 CCI Command Test Suite Report</h2>
+  <p><b>Timestamp:</b> {started} &nbsp;|&nbsp; <b>Target Device:</b> <code>{dev_path}</code></p>
+  <p><b>Summary:</b> {passed} Passed &nbsp;|&nbsp; {skipped} Skipped &nbsp;|&nbsp; {failed} Failed &nbsp;|&nbsp; {total} Total</p>
+  <table>
+    <tr><th>Status</th><th>Phase</th><th>Category</th><th>Test Case</th><th>Duration</th><th>Assertion Details</th></tr>
+    {''.join(rows)}
+  </table>
+</body>
+</html>"""
+
+    with open(html_path, "w") as f:
+        f.write(html)
+
+    print(f"\nSummary: {passed}/{total} PASSED, {skipped} SKIPPED, {failed} FAILED")
+    print(f"Reports saved:\n  TXT : {txt_path}\n  HTML: {html_path}")
+
+
+def run_cci_suite(memdev="mem0", mode="all", bin_dir=""):
+    if not vm_is_running():
+        print("VM is not running, skip CCI tests")
+        return
+
+    if not cxl.cxl_driver_loaded():
+        cxl.load_driver()
+
+    dev_path = memdev if memdev.startswith("/dev/") else f"/dev/cxl/{memdev}"
+    started = datetime.datetime.now()
+
+    _deploy_guest_binary()
+    raw_out = execute_on_vm(f"{GUEST_BIN_REMOTE} {dev_path} {mode}") or ""
+
+    results = []
+    for line in raw_out.splitlines():
+        if line.startswith("__JSON_RESULT__:"):
+            payload = line.split("__JSON_RESULT__:", 1)[1]
+            results = json.loads(payload)
+            break
+
+    if not results:
+        print("Error: Failed to parse test results from guest:")
+        print(raw_out)
+        return
+
+    total = len(results)
+    current_phase = None
+
+    for index, r in enumerate(results, start=1):
+        if r["phase"] != current_phase:
+            current_phase = r["phase"]
+
+            print()
+            print("=" * 72)
+
+            if current_phase == "Week 5":
+                print("WEEK 5 - CCI FUNCTIONAL TESTS")
+            elif current_phase == "Week 6":
+                print("WEEK 6 - NEGATIVE / ERROR-HANDLING TESTS")
+            else:
+                print(current_phase)
+
+            print("=" * 72)
+
+        print_test_result(
+            index=index,
+            total=total,
+            status=r["status"],
+            week=r["phase"],
+            category=r["category"],
+            name=r["name"],
+            elapsed=float(r["elapsed"]),
+            detail=r["detail"],
+        )
+
+    _write_reports(results, dev_path, started)
+
+     
+
+     

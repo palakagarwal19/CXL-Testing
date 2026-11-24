@@ -1,0 +1,9 @@
+.vars.config
+.cxl-topology.xml
+*.swp
+*~
+.*
+*.pyc
+*/*.pyc
+utils/__pycache__
+utils/__pycache__/*
